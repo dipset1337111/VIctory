@@ -117,6 +117,9 @@ jobs:
           }
           '@
           $makeDescriptor = '/// Makes the host descriptor for `view` at `at`: the host resource it'
+          $previousGuard = $previousGuard.Replace("`r`n", "`n")
+          $typedGuard = $typedGuard.Replace("`r`n", "`n")
+          $typedStore = $typedStore.Replace("`r`n", "`n")
           if (!$descriptorText.Contains($previousGuard) -or !$descriptorText.Contains($makeDescriptor)) {
             throw 'Unexpected host descriptor implementation'
           }
