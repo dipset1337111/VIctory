@@ -12,26 +12,108 @@ jobs:
   build:
     runs-on: windows-latest
     timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - variant: baseline
+            source: ffe310eb2098e52169f4c44db5ffdabf43a72622
+          - variant: wave64
+            source: 54b333fc5c2793bd5b7cd539f11fa4e326c5fb0d
     steps:
       - uses: actions/checkout@v5
         with:
           fetch-depth: 0
           persist-credentials: false
-      - name: Apply the pinned Wave64 changes
+      - name: Prepare the pinned diagnostic source
         shell: pwsh
+        env:
+          SOURCE_SHA: ${{ matrix.source }}
         run: |
-          $candidate = '54b333fc5c2793bd5b7cd539f11fa4e326c5fb0d'
-          $expectedBase = 'ffe310eb2098e52169f4c44db5ffdabf43a72622'
-          git fetch --no-tags https://github.com/Marvisak/VIctory.git $candidate
-          if ($LASTEXITCODE -ne 0) { throw 'Could not fetch the pinned Wave64 commit' }
-          $actualBase = git merge-base HEAD $candidate
-          if ($LASTEXITCODE -ne 0 -or $actualBase -cne $expectedBase) { throw 'Unexpected Wave64 merge base' }
-          git -c user.name='GitHub Actions' -c user.email='actions@users.noreply.github.com' merge --no-commit --no-ff $candidate
-          if ($LASTEXITCODE -ne 0) {
-            git diff --name-only --diff-filter=U
-            throw 'Wave64 changes require conflict resolution'
-          }
-          git diff --cached --stat
+          $source = $env:SOURCE_SHA
+          $agility = 'e8af2d3ec82b5e882cff75c4242b6906c186b560'
+          git fetch --no-tags https://github.com/Marvisak/VIctory.git $source
+          if ($LASTEXITCODE -ne 0) { throw 'Could not fetch the pinned source' }
+          git switch --detach $source
+          if ($LASTEXITCODE -ne 0) { throw 'Could not switch to the pinned source' }
+          $agilityPatch = Join-Path $env:RUNNER_TEMP 'agility.patch'
+          git diff --output="$agilityPatch" "$agility^" $agility -- apps/victory
+          if ($LASTEXITCODE -ne 0) { throw 'Could not extract the Agility changes' }
+          git apply "$agilityPatch"
+          if ($LASTEXITCODE -ne 0) { throw 'Could not apply the Agility changes' }
+          $uavPatch = Join-Path $env:RUNNER_TEMP 'typed-uav.patch'
+          @'
+          diff --git a/crates/victory-gpu/src/descriptor/host.rs b/crates/victory-gpu/src/descriptor/host.rs
+          --- a/crates/victory-gpu/src/descriptor/host.rs
+          +++ b/crates/victory-gpu/src/descriptor/host.rs
+          @@ -609,8 +609,21 @@
+          -    if view == 0 {
+          -        return !typeless;
+          -    }
+          -    if family(view) != family(own) {
+          -        once!(view, own, "view format of another family");
+          -        return false;
+          -    }
+          -    if let Some(format) = format
+          +    if view == 0 {
+          +        if typeless {
+          +            return false;
+          +        }
+          +        if unordered && !typed_store(own) {
+          +            once!(own, "an unordered view in a format the host cannot store");
+          +            return false;
+          +        }
+          +        return true;
+          +    }
+          +    if family(view) != family(own) {
+          +        once!(view, own, "view format of another family");
+          +        return false;
+          +    }
+          +    // The host view of a typed texture uses the texture's format.
+          +    let made = if typeless { view } else { own };
+          +    if unordered && !typed_store(made) {
+          +        once!(view, own, "an unordered view in a format the host cannot store");
+          +        return false;
+          +    }
+          +    if let Some(format) = format
+          @@ -621,6 +634,33 @@
+               true
+           }
+           
+          +/// Whether the host stores to typed unordered views of `format`.
+          +fn typed_store(format: u32) -> bool {
+          +    static KNOWN: Mutex<Vec<(u32, bool)>> = Mutex::new(Vec::new());
+          +    let mut known = KNOWN.lock().unwrap_or_else(|e| e.into_inner());
+          +    if let Some(&(_, ok)) = known.iter().find(|(f, _)| *f == format) {
+          +        return ok;
+          +    }
+          +    let mut support = D3D12_FEATURE_DATA_FORMAT_SUPPORT {
+          +        Format: DXGI_FORMAT(format as i32),
+          +        ..Default::default()
+          +    };
+          +    let ok = host().is_some_and(|h| {
+          +        // SAFETY: a plain query into a struct of its size.
+          +        unsafe {
+          +            h.device.CheckFeatureSupport(
+          +                D3D12_FEATURE_FORMAT_SUPPORT,
+          +                (&raw mut support).cast(),
+          +                size_of_val(&support) as u32,
+          +            )
+          +        }
+          +        .is_ok()
+          +            && support.Support1.0 & D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW.0 != 0
+          +    });
+          +    known.push((format, ok));
+          +    ok
+          +}
+          +
+           /// Makes the host descriptor for `view` at `at`: the host resource it
+           /// views, or `None` if it cannot.
+           fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
+          '@ | Set-Content -LiteralPath $uavPatch -Encoding utf8NoBOM
+          git apply "$uavPatch"
+          if ($LASTEXITCODE -ne 0) { throw 'Could not apply the typed UAV format guard' }
+          git status --short
       - run: rustup toolchain install
       - name: Build diagnostic executable
         run: cargo build --profile diag -p victory --features diagnostics,agility --locked
@@ -67,7 +149,7 @@ jobs:
           }
       - uses: actions/upload-artifact@v4
         with:
-          name: victory-windows-agility-wave64-diag
+          name: victory-windows-agility-${{ matrix.variant }}-diag
           path: |
             target/diag/victory.exe
             target/diag/D3D12/D3D12Core.dll
