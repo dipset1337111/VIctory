@@ -13,8 +13,6 @@ jobs:
     steps:
       - uses: actions/checkout@v5
       - run: rustup toolchain install
-      - name: Run workspace tests
-        run: cargo test --workspace --locked
       - name: Build diagnostic executable
         run: cargo build --profile diag -p victory --features diagnostics --locked
       - name: Upload diagnostic executable
@@ -23,3 +21,5 @@ jobs:
           name: victory-windows-diag
           path: target/diag/victory.exe
           if-no-files-found: error
+      - name: Run workspace tests
+        run: cargo test --workspace --locked
