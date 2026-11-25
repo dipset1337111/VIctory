@@ -36,11 +36,23 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw 'Could not fetch the pinned source' }
           git switch --detach $source
           if ($LASTEXITCODE -ne 0) { throw 'Could not switch to the pinned source' }
-          $agilityPatch = Join-Path $env:RUNNER_TEMP 'agility.patch'
-          git diff --output="$agilityPatch" "$agility^" $agility -- apps/victory
-          if ($LASTEXITCODE -ne 0) { throw 'Could not extract the Agility changes' }
-          git apply "$agilityPatch"
-          if ($LASTEXITCODE -ne 0) { throw 'Could not apply the Agility changes' }
+          git restore --source=$agility -- apps/victory/build.rs apps/victory/src/agility.rs
+          if ($LASTEXITCODE -ne 0) { throw 'Could not copy the pinned Agility exports' }
+          $manifest = (Resolve-Path 'apps/victory/Cargo.toml').Path
+          $manifestText = [IO.File]::ReadAllText($manifest)
+          $features = '(?m)^\[features\]\r?\n'
+          if ([regex]::Matches($manifestText, $features).Count -ne 1) { throw 'Unexpected Cargo feature section' }
+          [IO.File]::WriteAllText($manifest, [regex]::Replace($manifestText, $features, { param($match) $match.Value + "agility = []`n" }))
+          $main = (Resolve-Path 'apps/victory/src/main.rs').Path
+          $mainText = [IO.File]::ReadAllText($main)
+          $modules = '(?m)^mod census;'
+          if ([regex]::Matches($mainText, $modules).Count -ne 1) { throw 'Unexpected app module declarations' }
+          $agilityModule = @'
+          #[cfg(all(windows, target_env = "msvc", feature = "agility"))]
+          mod agility;
+
+          '@
+          [IO.File]::WriteAllText($main, $mainText -replace $modules, ($agilityModule + "`nmod census;"))
           $uavPatch = Join-Path $env:RUNNER_TEMP 'typed-uav.patch'
           @'
           diff --git a/crates/victory-gpu/src/descriptor/host.rs b/crates/victory-gpu/src/descriptor/host.rs
@@ -111,7 +123,7 @@ jobs:
            /// views, or `None` if it cannot.
            fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
           '@ | Set-Content -LiteralPath $uavPatch -Encoding utf8NoBOM
-          git apply "$uavPatch"
+          git apply --unidiff-zero "$uavPatch"
           if ($LASTEXITCODE -ne 0) { throw 'Could not apply the typed UAV format guard' }
           git status --short
       - run: rustup toolchain install
