@@ -1,0 +1,180 @@
+name: Build VIctory with increased capped descriptor reserve
+
+on:
+  push:
+    branches: [diagnostics/wave64-descriptor-reserve]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Prepare the pinned diagnostic source
+        shell: pwsh
+        env:
+          SOURCE_SHA: 54b333fc5c2793bd5b7cd539f11fa4e326c5fb0d
+        run: |
+          $source = $env:SOURCE_SHA
+          $agility = 'e8af2d3ec82b5e882cff75c4242b6906c186b560'
+          git fetch --no-tags https://github.com/Marvisak/VIctory.git $source
+          if ($LASTEXITCODE -ne 0) { throw 'Could not fetch the pinned source' }
+          git switch --detach $source
+          if ($LASTEXITCODE -ne 0) { throw 'Could not switch to the pinned source' }
+          $bufferStates = 'c99e4290b628a3842ec558e500d7d1c5a75d213f'
+          git fetch --no-tags https://github.com/Marvisak/VIctory.git $bufferStates
+          if ($LASTEXITCODE -ne 0) { throw 'Could not fetch the pinned buffer state patch' }
+          $common = git merge-base $source $bufferStates
+          if ($LASTEXITCODE -ne 0 -or $common -cne 'ffe310eb2098e52169f4c44db5ffdabf43a72622') {
+            throw 'Unexpected buffer state merge base'
+          }
+          git -c user.name='GitHub Actions' -c user.email='actions@users.noreply.github.com' merge --no-commit --no-ff $bufferStates
+          if ($LASTEXITCODE -ne 0) {
+            git diff --name-only --diff-filter=U
+            throw 'The buffer state patch requires conflict resolution'
+          }
+          git restore --source=$agility -- apps/victory/build.rs apps/victory/src/agility.rs
+          if ($LASTEXITCODE -ne 0) { throw 'Could not copy the pinned Agility exports' }
+          $manifest = (Resolve-Path 'apps/victory/Cargo.toml').Path
+          $manifestText = [IO.File]::ReadAllText($manifest)
+          $features = '(?m)^\[features\]\r?\n'
+          if ([regex]::Matches($manifestText, $features).Count -ne 1) { throw 'Unexpected Cargo feature section' }
+          [IO.File]::WriteAllText($manifest, [regex]::Replace($manifestText, $features, { param($match) $match.Value + "agility = []`n" }))
+          $main = (Resolve-Path 'apps/victory/src/main.rs').Path
+          $mainText = [IO.File]::ReadAllText($main)
+          $modules = '(?m)^mod census;'
+          if ([regex]::Matches($mainText, $modules).Count -ne 1) { throw 'Unexpected app module declarations' }
+          $agilityModule = @'
+          #[cfg(all(windows, target_env = "msvc", feature = "agility"))]
+          mod agility;
+
+          '@
+          [IO.File]::WriteAllText($main, [regex]::Replace($mainText, $modules, ($agilityModule + "`nmod census;")))
+          $descriptor = (Resolve-Path 'crates/victory-gpu/src/descriptor/host.rs').Path
+          $descriptorText = [IO.File]::ReadAllText($descriptor).Replace("`r`n", "`n")
+          $previousGuard = @'
+              if view == 0 {
+                  return !typeless;
+              }
+              if family(view) != family(own) {
+                  once!(view, own, "view format of another family");
+                  return false;
+              }
+              if let Some(format) = format
+          '@
+          $typedGuard = @'
+              if view == 0 {
+                  if typeless {
+                      return false;
+                  }
+                  if unordered && !typed_store(own) {
+                      once!(own, "an unordered view in a format the host cannot store");
+                      return false;
+                  }
+                  return true;
+              }
+              if family(view) != family(own) {
+                  once!(view, own, "view format of another family");
+                  return false;
+              }
+              // The host view of a typed texture uses the texture's format.
+              let made = if typeless { view } else { own };
+              if unordered && !typed_store(made) {
+                  once!(view, own, "an unordered view in a format the host cannot store");
+                  return false;
+              }
+              if let Some(format) = format
+          '@
+          $typedStore = @'
+          /// Whether the host stores to typed unordered views of `format`.
+          fn typed_store(format: u32) -> bool {
+              static KNOWN: Mutex<Vec<(u32, bool)>> = Mutex::new(Vec::new());
+              let mut known = KNOWN.lock().unwrap_or_else(|e| e.into_inner());
+              if let Some(&(_, ok)) = known.iter().find(|(f, _)| *f == format) {
+                  return ok;
+              }
+              let mut support = D3D12_FEATURE_DATA_FORMAT_SUPPORT {
+                  Format: DXGI_FORMAT(format as i32),
+                  ..Default::default()
+              };
+              let ok = host().is_some_and(|h| {
+                  // SAFETY: a plain query into a struct of its size.
+                  unsafe {
+                      h.device.CheckFeatureSupport(
+                          D3D12_FEATURE_FORMAT_SUPPORT,
+                          (&raw mut support).cast(),
+                          size_of_val(&support) as u32,
+                      )
+                  }
+                  .is_ok()
+                      && support.Support1.0 & D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW.0 != 0
+              });
+              known.push((format, ok));
+              ok
+          }
+          '@
+          $makeDescriptor = '/// Makes the host descriptor for `view` at `at`: the host resource it'
+          $previousGuard = $previousGuard.Replace("`r`n", "`n")
+          $typedGuard = $typedGuard.Replace("`r`n", "`n")
+          $typedStore = $typedStore.Replace("`r`n", "`n")
+          if (!$descriptorText.Contains($previousGuard) -or !$descriptorText.Contains($makeDescriptor)) {
+            throw 'Unexpected host descriptor implementation'
+          }
+          $descriptorText = $descriptorText.Replace($previousGuard, $typedGuard)
+          # Preserve the host's heap limit and the reserve used on uncapped heaps.
+          $cappedSplit = 'PORTABLE_VIEWS - MIN_DYNAMIC, MIN_DYNAMIC'
+          if ($descriptorText.Split($cappedSplit, [System.StringSplitOptions]::None).Count -ne 2) {
+            throw 'Unexpected capped descriptor heap layout'
+          }
+          $descriptorText = $descriptorText.Replace($cappedSplit, 'PORTABLE_VIEWS - DYNAMIC, DYNAMIC')
+          $descriptorText = $descriptorText.Replace('tracing::debug!(count, sampler, "host descriptor heap");', 'tracing::debug!(count, sampler, dynamic_slots = extra, "host descriptor heap");')
+          [IO.File]::WriteAllText($descriptor, $descriptorText.Replace($makeDescriptor, ($typedStore + "`n`n" + $makeDescriptor)))
+          git status --short
+      - run: rustup toolchain install
+      - name: Build diagnostic executable
+        run: cargo build --profile diag -p victory --features diagnostics,agility --locked
+      - name: Stage Microsoft D3D12 runtime
+        shell: pwsh
+        run: |
+          $version = '1.620.2'
+          $package = "microsoft.direct3d.d3d12.$version.nupkg"
+          $baseUrl = "https://api.nuget.org/v3-flatcontainer/microsoft.direct3d.d3d12/$version"
+          $zip = Join-Path $env:RUNNER_TEMP 'd3d12-sdk.zip'
+          Invoke-WebRequest -Uri "$baseUrl/$package" -OutFile $zip
+          $expected = 'd683ff7f5726906c3f43d299f6cdd4b1cad22f8329ccd27b3492d0a1413d9904102b8d543419bec3b3545c86bf49f6a500ebf42d95c999aa0969e5d693032735'
+          $actual = (Get-FileHash -LiteralPath $zip -Algorithm SHA512).Hash.ToLowerInvariant()
+          if ($actual -cne $expected) { throw 'NuGet package SHA-512 mismatch' }
+          $unpacked = Join-Path $env:RUNNER_TEMP 'd3d12-sdk'
+          Expand-Archive -LiteralPath $zip -DestinationPath $unpacked
+          $destination = 'target/diag/D3D12'
+          New-Item -ItemType Directory -Path $destination -Force | Out-Null
+          foreach ($name in @('D3D12Core.dll', 'd3d12SDKLayers.dll')) {
+            $dll = Join-Path $unpacked "build/native/bin/x64/$name"
+            $signature = Get-AuthenticodeSignature -LiteralPath $dll
+            if ($signature.Status -ne 'Valid' -or $signature.SignerCertificate.Subject -notmatch 'O=Microsoft Corporation') {
+              throw "$name does not have a valid Microsoft signature"
+            }
+            Copy-Item -LiteralPath $dll -Destination (Join-Path $destination $name)
+          }
+      - name: Verify diagnostic executable exports
+        shell: pwsh
+        run: |
+          $report = & target/diag/victory.exe inspect target/diag/victory.exe --exports | Out-String
+          if ($LASTEXITCODE -ne 0 -or $report -notmatch 'D3D12SDKVersion' -or $report -notmatch 'D3D12SDKPath') {
+            throw 'The diagnostic executable does not export the Agility SDK settings'
+          }
+      - uses: actions/upload-artifact@v4
+        with:
+          name: victory-windows-agility-wave64-descriptor-reserve-diag
+          path: |
+            target/diag/victory.exe
+            target/diag/D3D12/D3D12Core.dll
+            target/diag/D3D12/d3d12SDKLayers.dll
+          if-no-files-found: error
