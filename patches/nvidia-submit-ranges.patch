@@ -1,0 +1,182 @@
+--- a/crates/victory-gpu/src/shadow.rs
++++ b/crates/victory-gpu/src/shadow.rs
+@@ -2874,8 +2874,56 @@
+ // SAFETY: as above.
+ unsafe impl Sync for Shadow {}
+ 
+-impl Shadow {
+-    /// The host GPU address of a title address inside the buffer.
++/// Remove the intersection with an earlier write, keeping the remaining spans sorted.
++fn subtract_snapshot_span(parts: &mut Vec<(usize, usize)>, start: usize, end: usize) {
++    if start >= end {
++        return;
++    }
++    let first = parts.partition_point(|&(_, hi)| hi <= start);
++    let Some(&(lo, hi)) = parts.get(first) else { return };
++    if lo >= end {
++        return;
++    }
++    if lo < start && end < hi {
++        parts[first].1 = start;
++        parts.insert(first + 1, (end, hi));
++        return;
++    }
++    let past = first + parts[first..].partition_point(|&(lo, _)| lo < end);
++    let last_end = parts[past - 1].1;
++    let mut remove_from = first;
++    if lo < start {
++        parts[first].1 = start;
++        remove_from += 1;
++    }
++    let mut remove_to = past;
++    if end < last_end {
++        parts[past - 1].0 = end;
++        remove_to -= 1;
++    }
++    parts.drain(remove_from..remove_to);
++}
++
++#[test]
++fn snapshot_span_subtraction_matches_byte_coverage() {
++    for a in 0..=8 {
++        for b in a..=8 {
++            for c in 0..=8 {
++                for d in c..=8 {
++                    let mut spans = vec![(1, 7)];
++                    subtract_snapshot_span(&mut spans, a, b);
++                    subtract_snapshot_span(&mut spans, c, d);
++                    let bytes: Vec<_> = spans.iter().flat_map(|&(lo, hi)| lo..hi).collect();
++                    let expected: Vec<_> = (1..7).filter(|x| !(a..b).contains(x) && !(c..d).contains(x)).collect();
++                    assert_eq!(bytes, expected);
++                }
++            }
++        }
++    }
++}
++
++impl Shadow {
++    /// The host GPU address of a title address inside the buffer.
+     pub(crate) fn gpu(&self, address: u64) -> u64 {
+         self.gpu + (address - self.start)
+     }
+@@ -3054,24 +3102,14 @@
+         // The parts no declared range holds yet: their bytes are taken now,
+         // just after the range's refresh (a part declared earlier has not
+         // been refreshed since, and keeps the bytes taken then).
+-        let mut parts = vec![self.inside(address, len)];
+-        for &(a, e) in pending.iter() {
+-            let (a, e) = self.inside(a, e - a);
+-            let mut rest = Vec::with_capacity(parts.len() + 1);
+-            for (from, to) in parts {
+-                if e <= from || a >= to {
+-                    rest.push((from, to));
+-                    continue;
+-                }
+-                if from < a {
+-                    rest.push((from, a));
+-                }
+-                if e < to {
+-                    rest.push((e, to));
+-                }
+-            }
+-            parts = rest;
+-        }
++        let mut parts = vec![self.inside(address, len)];
++        for &(a, e) in pending.iter() {
++            let (a, e) = self.inside(a, e - a);
++            subtract_snapshot_span(&mut parts, a, e);
++            if parts.is_empty() {
++                break;
++            }
++        }
+         pending.push(range);
+         let taken: usize = parts.iter().map(|&(from, to)| to.saturating_sub(from)).sum();
+         BACK_CLASS[usize::from(!self.window)].fetch_add(taken as u64, Ordering::Relaxed);
+--- a/crates/victory-gpu/src/host.rs
++++ b/crates/victory-gpu/src/host.rs
+@@ -5597,31 +5597,41 @@
+             self.settle(&mut submitted, WHY_STALE);
+             settled += settling.elapsed();
+         }
+-        #[cfg(feature = "diagnostics")]
+-        split.part(1);
+-        // What flights in the air may write.
+-        let air = line().written.clone();
+-        stage.next("submit: refreshes ahead of writes");
+-        if refresh_front() {
+-            batch.refresh_front(runs, &parts);
+-        } else if ahead_of_writes() {
+-            batch.refresh_ahead(runs, |list, i| own.as_ref().is_some_and(|own| own.takes(list, i)));
+-        }
+-        stage.next("submit: the lists' steps");
+-        for list in runs {
+-            list.run_deferred(&mut batch, &air, |i| own.as_ref().is_some_and(|own| own.takes(list, i)));
+-            firsts.push(lists.len());
+-            if let Some(prelude) = list.prelude() {
+-                lists.push(Some(prelude));
+-            }
+-            lists.push(list.list.cast().ok());
+-        }
+-        batch.fill();
+-        stage.next("submit: the last refreshes");
+-        batch.flush();
+-        crate::watch::ask_once_end();
+-        #[cfg(feature = "diagnostics")]
+-        split.part(2);
++        #[cfg(feature = "diagnostics")]
++        split.part(1);
++        // What flights in the air may write.
++        #[cfg(feature = "diagnostics")]
++        let details = Split::begin();
++        let air = line().written.clone();
++        stage.next("submit: refreshes ahead of writes");
++        if refresh_front() {
++            batch.refresh_front(runs, &parts);
++        } else if ahead_of_writes() {
++            batch.refresh_ahead(runs, |list, i| own.as_ref().is_some_and(|own| own.takes(list, i)));
++        }
++        stage.next("submit: the lists' steps");
++        #[cfg(feature = "diagnostics")]
++        details.part(16);
++        for list in runs {
++            list.run_deferred(&mut batch, &air, |i| own.as_ref().is_some_and(|own| own.takes(list, i)));
++            #[cfg(feature = "diagnostics")]
++            details.part(17);
++            firsts.push(lists.len());
++            if let Some(prelude) = list.prelude() {
++                lists.push(Some(prelude));
++            }
++            lists.push(list.list.cast().ok());
++            #[cfg(feature = "diagnostics")]
++            details.part(18);
++        }
++        batch.fill();
++        stage.next("submit: the last refreshes");
++        batch.flush();
++        crate::watch::ask_once_end();
++        #[cfg(feature = "diagnostics")]
++        details.part(19);
++        #[cfg(feature = "diagnostics")]
++        split.part(2);
+         stage.next("submit: snapshots");
+         // The snapshots of the ranges shaders may write, if they were left
+         // for now (`crate::shadow::wide_back`): the refreshes are done, the
+@@ -7392,7 +7402,7 @@
+ /// the flights waited for, the heaps' records and what is swept; and, at the
+ /// end, the wait for the heaps' records.
+ #[cfg(feature = "diagnostics")]
+-static SPLIT: [std::sync::atomic::AtomicU64; 16] = [const { std::sync::atomic::AtomicU64::new(0) }; 16];
++static SPLIT: [std::sync::atomic::AtomicU64; 20] = [const { std::sync::atomic::AtomicU64::new(0) }; 20];
+ 
+ /// Since the last frame-rate line: flushes of refreshes, their refreshes,
+ /// those known to copy nothing, and those done on several threads.
+@@ -7425,7 +7435,8 @@
+ #[cfg(feature = "diagnostics")]
+ fn split_line(frames: f64) {
+     let ms: Vec<f64> = SPLIT.iter().map(|n| n.swap(0, Ordering::Relaxed) as f64 / 1e6 / frames).collect();
+-    let f: Vec<f64> = FLUSHES.iter().map(|n| n.swap(0, Ordering::Relaxed) as f64 / frames).collect();
++    tracing::info!("submission list steps per frame: front {:.2} ms, deferred {:.2} ms, state preludes and list collection {:.2} ms, final fill and flush {:.2} ms", ms[16], ms[17], ms[18], ms[19]);
++    let f: Vec<f64> = FLUSHES.iter().map(|n| n.swap(0, Ordering::Relaxed) as f64 / frames).collect();
+     let e: Vec<f64> = crate::watch::early_asks().iter().map(|&n| n as f64 / frames).collect();
+     let a: Vec<f64> = crate::watch::asks().iter().map(|&n| n as f64 / frames).collect();
+     let h: Vec<f64> = crate::draw::HEAP_SPLIT.iter().map(|n| n.swap(0, Ordering::Relaxed) as f64 / 1e6 / frames).collect();
