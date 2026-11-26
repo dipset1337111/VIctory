@@ -85,7 +85,7 @@ jobs:
           +}
           +
           +/// Whether [`copy_streaming`] streams.
-          +fn streaming_copy_enabled() {
+          +fn streaming_copy_enabled() -> bool {
           +    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
           +    *ON.get_or_init(|| avx2() && std::env::var_os("VICTORY_STREAM_COPY").is_some_and(|v| v == "1"))
           +}
