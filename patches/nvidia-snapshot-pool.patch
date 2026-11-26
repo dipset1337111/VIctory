@@ -1,0 +1,73 @@
+--- a/crates/victory-gpu/src/shadow.rs
++++ b/crates/victory-gpu/src/shadow.rs
+@@ -1257,22 +1257,44 @@
+ /// of about that size: a small copy's snapshot took the 174 MB buffer kept
+ /// for the big heap's, which then got another, until eight of them were
+ /// reserved (1.4 GB in run 24).
+-fn pooled(n: usize) -> Vec<u8> {
+-    let mut pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
+-    let most = n.saturating_mul(4).max(1 << 20);
+-    let fit = pool
+-        .iter()
+-        .enumerate()
+-        .filter(|(_, v)| v.capacity() >= n && v.capacity() <= most)
+-        .min_by_key(|(_, v)| v.capacity())
+-        .map(|(i, _)| i);
+-    let mut v = match fit {
+-        Some(i) => pool.swap_remove(i),
+-        None => Vec::with_capacity(n),
+-    };
+-    v.clear();
+-    v
+-}
++fn take_snapshot_buffer(pool: &mut Vec<Vec<u8>>, n: usize) -> Option<Vec<u8>> {
++    let most = n.saturating_mul(4).max(1 << 20);
++    let end = pool.partition_point(|buf| buf.capacity() >= n);
++    let best = end.checked_sub(1)?;
++    (pool[best].capacity() <= most).then(|| pool.remove(best))
++}
++
++fn insert_snapshot_buffer(pool: &mut Vec<Vec<u8>>, buffer: Vec<u8>) {
++    let at = pool.partition_point(|buf| buf.capacity() >= buffer.capacity());
++    pool.insert(at, buffer);
++}
++
++fn pooled(n: usize) -> Vec<u8> {
++    let cached = {
++        let mut pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
++        take_snapshot_buffer(&mut pool, n)
++    };
++    // An allocation can fault or wait on the allocator. Other submitters
++    // and the landing thread can keep using the pool while it does.
++    let mut buffer = cached.unwrap_or_else(|| Vec::with_capacity(n));
++    buffer.clear();
++    buffer
++}
++
++#[test]
++fn snapshot_pool_matches_best_fit_after_returns_and_misses() {
++    let mut pool = Vec::new();
++    for size in [33, 4096, 52, 4096, 2 << 20, 16, 80, 0] {
++        insert_snapshot_buffer(&mut pool, Vec::with_capacity(size));
++    }
++    for n in [0, 30, 50, 65, 4000, 100, 18, 4096, 1 << 20, 1] {
++        let most = (n * 4).max(1 << 20);
++        let expected = pool.iter().map(Vec::capacity).filter(|&cap| n <= cap && cap <= most).min();
++        let found = take_snapshot_buffer(&mut pool, n);
++        assert_eq!(found.as_ref().map(Vec::capacity), expected);
++        assert!(pool.windows(2).all(|pair| pair[0].capacity() >= pair[1].capacity()));
++    }
++}
+ 
+ /// How many snapshot buffers are kept (`VICTORY_SNAPSHOT_POOL`; `8`: as
+ /// before).
+@@ -1294,8 +1316,7 @@
+ fn give_back(v: Vec<u8>) {
+     const KEPT: usize = 512 << 20;
+     let mut pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
+-    pool.push(v);
+-    pool.sort_by_key(|v| std::cmp::Reverse(v.capacity()));
++    insert_snapshot_buffer(&mut pool, v);
+     let (mut kept, mut total) = (0, 0usize);
+     for v in pool.iter().take(snapshots_kept()) {
+         total = total.saturating_add(v.capacity());
