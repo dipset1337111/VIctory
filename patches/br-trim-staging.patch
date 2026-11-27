@@ -97,8 +97,7 @@
      // running.
 @@ -526,6 +568,17 @@
      map.retain(|_, s| {
--        let keep = Arc::strong_count(s) > 1
-+        let keep = Arc::strong_count(s) > 1 || (trim && s.waiting.load(Relaxed) != 0)
+         let keep = Arc::strong_count(s) > 1
              || !crate::host::long_ago(s.used.load(Relaxed), idle_ms, IDLE_FRAMES);
 +        if keep && trim
 +            && let Some(s) = Arc::get_mut(s)
