@@ -1,0 +1,19 @@
+diff --git a/crates/victory-gpu/src/descriptor/host.rs b/crates/victory-gpu/src/descriptor/host.rs
+--- a/crates/victory-gpu/src/descriptor/host.rs
++++ b/crates/victory-gpu/src/descriptor/host.rs
+@@ -4783,3 +4783,16 @@
+ fn changed_records(last: &mut [u8], records: &[u8], step: usize, first: u32, out: &mut Vec<u32>) {
++    // Descriptor increments are fixed for a heap. Dispatch once per page so
++    // the inner equality checks and copies can use constant-size operations.
++    match step {
++        16 => changed_records_inner(last, records, 16, first, out),
++        32 => changed_records_inner(last, records, 32, first, out),
++        64 => changed_records_inner(last, records, 64, first, out),
++        _ => changed_records_inner(last, records, step, first, out),
++    }
++}
++
++#[inline(always)]
++fn changed_records_inner(last: &mut [u8], records: &[u8], step: usize, first: u32, out: &mut Vec<u32>) {
+     const AT_A_TIME: usize = 16;
+     let block = AT_A_TIME * step;

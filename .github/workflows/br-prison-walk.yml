@@ -2,7 +2,7 @@ name: BR prison walk
 
 on:
   push:
-    branches: [perf/br-prison-walk]
+    branches: [perf/br-fixed-descriptor-stride]
   workflow_dispatch:
 
 permissions:
@@ -25,6 +25,28 @@ jobs:
       - run: git -C br apply ../patches/br-cache-checkpoint.patch
       - name: Apply contiguous descriptor reads
         run: git -C br apply ../patches/br-descriptor-reads.patch
+      - name: Benchmark descriptor comparison on identical buffers
+        shell: pwsh
+        working-directory: br
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $path = 'crates/victory-gpu/src/descriptor/host.rs'
+          function Read-Kernel {
+            $s = [IO.File]::ReadAllText((Resolve-Path $path))
+            $i = $s.IndexOf('fn changed_records(')
+            $j = $s.IndexOf('#[cfg(test)]', $i)
+            return $s.Substring($i, $j - $i)
+          }
+          $original = (Read-Kernel).Replace('fn changed_records(', 'fn reference(')
+          git apply --recount ../patches/br-fixed-stride.patch
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          $candidate = Read-Kernel
+          $bench = Get-Content ../scripts/stride-bench.rs -Raw
+          Set-Content $env:RUNNER_TEMP/stride.rs -Value ($original + $candidate + $bench) -Encoding utf8NoBOM
+          rustc --edition=2024 -O $env:RUNNER_TEMP/stride.rs -o $env:RUNNER_TEMP/stride.exe
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          & "$env:RUNNER_TEMP/stride.exe" | Tee-Object -FilePath ../stride-results.txt
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
       - name: Check grouped reads against page-by-page results
         working-directory: br
         run: |
@@ -85,8 +107,9 @@ jobs:
           & br/target/release/victory.exe run --help
       - uses: actions/upload-artifact@v4
         with:
-          name: victory-br-prison-walk
+          name: victory-br-fixed-stride
           path: |
+            stride-results.txt
             br/target/release/Run-Walk.ps1
             br/target/release/victory.exe
             br/target/release/D3D12/D3D12Core.dll
