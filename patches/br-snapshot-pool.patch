@@ -1,0 +1,37 @@
+--- a/crates/victory-gpu/src/shadow.rs
++++ b/crates/victory-gpu/src/shadow.rs
+@@ -1333,16 +1333,13 @@
+ fn pooled(n: usize) -> Vec<u8> {
+     let mut pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
+     let most = n.saturating_mul(4).max(1 << 20);
+-    let fit = pool
+-        .iter()
+-        .enumerate()
+-        .filter(|(_, v)| v.capacity() >= n && v.capacity() <= most)
+-        .min_by_key(|(_, v)| v.capacity())
+-        .map(|(i, _)| i);
+-    let mut v = match fit {
+-        Some(i) => pool.swap_remove(i),
+-        None => Vec::with_capacity(n),
+-    };
++    // Entries are largest first. Pick the smallest capacity that fits.
++    let end = pool.partition_point(|v| v.capacity() >= n);
++    let found = end.checked_sub(1)
++        .filter(|&index| pool[index].capacity() <= most)
++        .map(|index| pool.remove(index));
++    drop(pool);
++    let mut v = found.unwrap_or_else(|| Vec::with_capacity(n));
+     v.clear();
+     v
+ }
+@@ -1367,8 +1364,8 @@
+ fn give_back(v: Vec<u8>) {
+     const KEPT: usize = 512 << 20;
+     let mut pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
+-    pool.push(v);
+-    pool.sort_by_key(|v| std::cmp::Reverse(v.capacity()));
++    let index = pool.partition_point(|entry| entry.capacity() >= v.capacity());
++    pool.insert(index, v);
+     let (mut kept, mut total) = (0, 0usize);
+     for v in pool.iter().take(snapshots_kept()) {
+         total = total.saturating_add(v.capacity());
