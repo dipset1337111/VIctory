@@ -14,10 +14,10 @@ set "VICTORY_STREAMLINE_DIR=%root%\NVIDIA-Test\nvidia-sdk\Streamline\bin\x64"
 if not exist "%VICTORY_HOME%" mkdir "%VICTORY_HOME%"
 if not exist "%VICTORY_HOME%" goto missing
 > "%VICTORY_HOME%\victory-settings.txt" echo VICTORY_MENU_CONSOLE=series-s
->> "%VICTORY_HOME%\victory-settings.txt" echo VICTORY_MENU_FRAMEGEN=1
+>> "%VICTORY_HOME%\victory-settings.txt" echo VICTORY_MENU_FRAMEGEN=2
 >> "%VICTORY_HOME%\victory-settings.txt" echo VICTORY_MENU_DLSS=quality
 >> "%VICTORY_HOME%\victory-settings.txt" echo VICTORY_MFG_UNLOCKER=0
-"%root%\victory-watchdog.exe" play "%game%" --series-s --dlss quality --framegen --set VICTORY_WARMUP_RESTART=0 --set VICTORY_NO_WATCHDOG=1
+"%root%\victory-watchdog.exe" play "%game%" --series-s --dlss quality --framegen 2 --fg-type dlss --set VICTORY_WARMUP_RESTART=0 --set VICTORY_NO_WATCHDOG=1
 echo Exit code: %errorlevel%
 echo Logs: "%VICTORY_HOME%\logs"
 pause
