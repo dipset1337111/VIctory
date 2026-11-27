@@ -1,0 +1,49 @@
+name: Package verified Agility SDK for NVIDIA build
+on:
+  push:
+    branches: [build/nvidia-agility-614]
+permissions:
+  contents: read
+jobs:
+  package:
+    runs-on: windows-latest
+    steps:
+      - name: Verify package, runtime and probe
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $base = 'https://api.nuget.org/v3-flatcontainer/microsoft.direct3d.d3d12/1.614.1'
+          curl.exe -fsSL --retry 3 "$base/microsoft.direct3d.d3d12.1.614.1.nupkg" -o sdk.zip
+          if ($LASTEXITCODE) { exit 1 }
+          if ((Get-FileHash sdk.zip).Hash -ne '9880AA91602DD51DD6CF7911A2BCA7A2323513B15338573CDE014B3356EEAFF2') { throw 'Package hash mismatch' }
+          Expand-Archive sdk.zip sdk
+          New-Item -ItemType Directory -Path probe/D3D12 -Force
+          Copy-Item sdk/build/native/bin/x64/D3D12Core.dll probe/D3D12/
+          Copy-Item sdk/LICENSE.txt probe/D3D12/microsoft-d3d12-license.txt
+          $core = 'probe/D3D12/D3D12Core.dll'
+          if ((Get-FileHash $core).Hash -ne '8A23D826B25B4329522FF451CB52B7F2B34D7F2913CFEB878371CE8BD765FE2D') { throw 'Runtime hash mismatch' }
+          $sig = Get-AuthenticodeSignature $core
+          if ($sig.Status -ne 'Valid' -or $sig.SignerCertificate.Subject -notlike 'CN=Microsoft Corporation,*') { throw 'Invalid Microsoft signature' }
+          @'
+          @echo off
+          setlocal
+          cd /d "%~dp0"
+          if not exist victory.exe goto missing
+          victory.exe shader-model > sdk-check.txt 2>&1
+          set "probeExit=%errorlevel%"
+          type sdk-check.txt
+          if not "%probeExit%"=="0" goto done
+          findstr /r /x "6\.[6789] 6\.[1-9][0-9]" sdk-check.txt >nul
+          if errorlevel 1 goto done
+          if exist Start-Game.cmd call Start-Game.cmd
+          goto done
+          :missing
+          echo Extract this archive alongside victory.exe and Start-Game.cmd.
+          :done
+          pause
+          '@ | Set-Content probe/Check-and-Start.cmd -Encoding ascii
+      - uses: actions/upload-artifact@v4
+        with:
+          name: NVIDIA-D3D12-1.614.1
+          path: probe/
+          if-no-files-found: error
