@@ -1,0 +1,24 @@
+name: Build BR comparison
+on:
+  push:
+    branches: [perf/compare-br-8bb5142d]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: edsuuu/VI-BR-PORT
+          ref: 8bb5142d8b38f4a992102a4d50cd0c2202c47753
+          persist-credentials: false
+      - run: rustup toolchain install
+      - run: cargo build --locked --release -p victory
+      - run: target/release/victory.exe --help
+      - uses: actions/upload-artifact@v4
+        with:
+          name: victory-br-8bb5142d-release
+          path: target/release/victory.exe
+          if-no-files-found: error
