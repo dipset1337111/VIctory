@@ -2,7 +2,7 @@ name: BR prison walk
 
 on:
   push:
-    branches: [perf/br-fixed-descriptor-stride]
+    branches: [perf/br-snapshot-pool]
   workflow_dispatch:
 
 permissions:
@@ -46,6 +46,49 @@ jobs:
           rustc --edition=2024 -O $env:RUNNER_TEMP/stride.rs -o $env:RUNNER_TEMP/stride.exe
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
           & "$env:RUNNER_TEMP/stride.exe" | Tee-Object -FilePath ../stride-results.txt
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+      - name: Apply and test snapshot buffer reuse
+        shell: pwsh
+        working-directory: br
+        run: |
+          git apply ../patches/br-snapshot-pool.patch
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          $source = Get-Content crates/victory-gpu/src/shadow.rs -Raw
+          $start = $source.IndexOf('static POOL:')
+          $end = $source.IndexOf('const NOT_WATCHED:', $start)
+          $pool = $source.Substring($start, $end - $start)
+          $test = @'
+          fn main() {
+              let mut expected: Vec<usize> = Vec::new();
+              let mut seed = 123456u32;
+              for step in 0..100_000 {
+                  seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+                  let n = (seed >> 16) as usize % 4096;
+                  if step % 5 < 3 {
+                      let v = Vec::with_capacity(n);
+                      expected.push(v.capacity());
+                      expected.sort_unstable_by(|a,b| b.cmp(a));
+                      expected.truncate(snapshots_kept());
+                      give_back(v);
+                  } else {
+                      let fit = expected.iter().rposition(|&cap| cap >= n && cap <= (4*n).max(1<<20));
+                      let want = fit.map(|i| expected.remove(i)).unwrap_or(n);
+                      let got = pooled(n);
+                      assert_eq!(got.len(), 0);
+                      assert_eq!(got.capacity(), want);
+                  }
+                  let pool = POOL.lock().unwrap();
+                  assert!(pool.iter().map(Vec::capacity).eq(expected.iter().copied()));
+              }
+          }
+          '@
+          $src = Join-Path $env:RUNNER_TEMP 'snapshot_pool.rs'
+          $exe = Join-Path $env:RUNNER_TEMP 'snapshot_pool.exe'
+          Set-Content $src ("use std::sync::Mutex;" + [Environment]::NewLine + $pool + $test) -Encoding utf8NoBOM
+          rustc --edition=2024 -O $src -o $exe
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          $env:VICTORY_SNAPSHOT_POOL = '64'
+          & $exe
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
       - name: Check grouped reads against page-by-page results
         working-directory: br
@@ -107,7 +150,7 @@ jobs:
           & br/target/release/victory.exe run --help
       - uses: actions/upload-artifact@v4
         with:
-          name: victory-br-fixed-stride
+          name: victory-br-snapshot-pool
           path: |
             stride-results.txt
             br/target/release/Run-Walk.ps1
