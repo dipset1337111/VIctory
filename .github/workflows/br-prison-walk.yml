@@ -113,6 +113,13 @@ jobs:
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
           cargo test --release --locked -p victory-gpu --lib cached_city_footprints_match_layout -- --nocapture
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
+      - name: Verify texture staging under memory pressure
+        working-directory: br
+        run: |
+          git apply ../patches/br-trim-staging.patch
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          cargo test --release --locked -p victory-gpu --lib staging_trim_tests -- --nocapture
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
       - name: Build diagnostic executable
         working-directory: br
         run: cargo build --release -p victory --locked
@@ -157,8 +164,9 @@ jobs:
           & br/target/release/victory.exe run --help
       - uses: actions/upload-artifact@v4
         with:
-          name: victory-br-city-footprints
+          name: victory-br-staging
           path: |
+            Start-Game.cmd
             stride-results.txt
             br/target/release/Run-Walk.ps1
             br/target/release/victory.exe

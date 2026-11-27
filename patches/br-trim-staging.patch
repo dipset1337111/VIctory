@@ -1,0 +1,240 @@
+--- a/crates/victory-gpu/src/texture.rs
++++ b/crates/victory-gpu/src/texture.rs
+@@ -32,19 +32,34 @@
+     }};
+ }
+ 
+-/// A texture's upload state: the staging buffer laid out as the host
++struct UploadBacking {
++    buffer: ID3D12Resource,
++    base: u64,
++    _piece: Option<crate::pool::StagingPiece>,
++    data: *mut u8,
++}
++
++impl UploadBacking {
++    fn new(host: &crate::host::Host, bytes: u64) -> Option<Self> {
++        if let Some((piece, buffer, base, data)) = crate::pool::staging(host, bytes) {
++            return Some(Self { buffer, base, _piece: Some(piece), data });
++        }
++        let (buffer, data) = host.upload_buffer(bytes)?;
++        crate::host::name(&buffer, || format!("texture staging, {bytes} bytes"));
++        Some(Self { buffer, base: 0, _piece: None, data })
++    }
++}
++
++/// A texture's upload state: the staging buffer laid out as the host
+ /// texture's subresources, and what was last detiled.
+ pub(crate) struct Staging {
+-    /// A buffer of its own, or the block [`Staging::piece`] is part of.
+-    buffer: ID3D12Resource,
+-    /// Where in `buffer` it begins (the footprints count from there).
+-    base: u64,
+-    /// Back in the pool with the last list that names it.
+-    _piece: Option<crate::pool::StagingPiece>,
++    /// May be taken only with exclusive access to this staging record.
++    backing: std::sync::OnceLock<UploadBacking>,
++    changed: std::sync::atomic::AtomicU64,
++    retry_detile: std::sync::atomic::AtomicBool,
+     /// Its bytes.
+     #[cfg(feature = "diagnostics")]
+     size: u64,
+-    data: *mut u8,
+     footprints: Vec<D3D12_PLACED_SUBRESOURCE_FOOTPRINT>,
+     rows: Vec<u32>,
+     layout: victory_formats::texture::Layout,
+@@ -501,6 +516,28 @@
+     [LET_GO[0].load(Relaxed), LET_GO[1].load(Relaxed)]
+ }
+ 
++// Based on the unchanged-texture policy in PastiiJay/klbf-lab#23 (spy0eye-beep).
++fn can_trim(uploaded: bool, dirty: bool, waiting: u64, unchanged: bool) -> bool {
++    uploaded && !dirty && waiting == 0 && unchanged
++}
++
++#[cfg(test)]
++mod staging_trim_tests {
++    use super::can_trim;
++
++    #[test]
++    fn only_clean_completed_uploads_can_release_storage() {
++        assert!(can_trim(true, false, 0, true));
++        assert!(!can_trim(false, false, 0, true));
++        assert!(!can_trim(true, true, 0, true));
++        assert!(!can_trim(true, false, 1, true));
++        assert!(!can_trim(true, false, 0, false));
++    }
++}
++
++static TRIM_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
++static RESTORE_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
++
+ /// Lets go of the staging buffers no list recorded a use of for `IDLE_MS`
+ /// and `IDLE_FRAMES` frames and no list holds: a staging buffer is system memory the size of its
+ /// texture, kept so that an unchanged texture is not uploaded again, and
+@@ -511,14 +548,19 @@
+ pub(crate) fn let_go_idle() {
+     use std::sync::atomic::Ordering::Relaxed;
+     const IDLE_FRAMES: u64 = 4;
+-    let mut map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
+-    let Some(map) = map.as_mut() else {
++    let mut table = STAGING.lock().unwrap_or_else(|e| e.into_inner());
++    let Some(map) = table.as_mut() else {
+         return;
+     };
+     if map.is_empty() {
+         return;
+     }
+-    let idle_ms = crate::host::ram_idle_ms(crate::host::available_physical_ram());
++    let available = crate::host::available_physical_ram();
++    let idle_ms = crate::host::ram_idle_ms(available);
++    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
++    let trim = available.is_some_and(|bytes| bytes < (2u64 << 30))
++        && *ENABLED.get_or_init(|| std::env::var_os("VICTORY_STAGING_KEEP").is_none_or(|v| v != "1"));
++    let mut released = Vec::new();
+     // A list that recorded an upload or a check holds the staging until it
+     // is reset: one only the table holds is named by no list, recorded or
+     // running.
+@@ -526,6 +568,17 @@
+     map.retain(|_, s| {
+-        let keep = Arc::strong_count(s) > 1
++        let keep = Arc::strong_count(s) > 1 || (trim && s.waiting.load(Relaxed) != 0)
+             || !crate::host::long_ago(s.used.load(Relaxed), idle_ms, IDLE_FRAMES);
++        if keep && trim
++            && let Some(s) = Arc::get_mut(s)
++            && s.backing.get().is_some()
++            && !s.retry_detile.load(Relaxed)
++            && can_trim(s.uploaded.load(Relaxed), s.dirty.load(Relaxed), s.waiting.load(Relaxed),
++                crate::host::long_ago(s.changed.load(Relaxed), 2000, 30))
++            && let Some(storage) = s.backing.take()
++        {
++            TRIM_BYTES.fetch_add(s.bytes, Relaxed);
++            released.push(storage);
++        }
+         if !keep {
+             LET_GO[0].fetch_add(1, Relaxed);
+             LET_GO[1].fetch_add(s.bytes, Relaxed);
+@@ -534,6 +587,15 @@
+         }
+         keep
+     });
++    drop(table);
++    drop(released);
++    static LAST_REPORT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
++    let trimmed = TRIM_BYTES.load(Relaxed);
++    if trimmed != 0 && crate::host::long_ago(LAST_REPORT.load(Relaxed), 5000, 1) {
++        LAST_REPORT.store(crate::host::moment(), Relaxed);
++        tracing::info!(trimmed_bytes = trimmed, restored_bytes = RESTORE_BYTES.load(Relaxed),
++            "texture staging ranges released and rebuilt under RAM pressure");
++    }
+     if went > 0 {
+         crate::host::trail(|| format!("sweep: {went} staging buffers of textures let go ({} KiB), held by no list", bytes >> 10));
+     }
+@@ -825,7 +887,13 @@
+         };
+         staging.expected.store(there, Relaxed);
+     }
+-    record_upload(list, resource, texture, &staging, &staging.buffer, staging.base);
++    let Some(storage) = staging.backing.get() else {
++        // A change of level can request an upload before the next refresh.
++        // The refresh rebuilds the bytes; a later list can record their copy.
++        list.defer_texture(staging);
++        return;
++    };
++    record_upload(list, resource, texture, &staging, &storage.buffer, storage.base);
+     // When the list is submitted, its copy takes what the staging buffer
+     // holds by then: noted before the check below, which sets `dirty`
+     // again if it detiles (the next list then uploads once more).
+@@ -1253,6 +1321,9 @@
+         let start = self.memory as usize;
+         let mut last = waited(0, || self.last.lock().unwrap_or_else(|e| e.into_inner()));
+         let last = &mut *last;
++        if self.retry_detile.swap(false, std::sync::atomic::Ordering::Relaxed) {
++            *last = Last::default();
++        }
+         let alone = self.once.load(std::sync::atomic::Ordering::Relaxed);
+         if alone && last.hash.is_some() {
+             return 0;
+@@ -1476,7 +1547,21 @@
+ 
+     /// Detiles `tiled` (the texture's memory) into the staging buffer.
+     fn detile(&self, tiled: &[u8]) {
+-        self.dirty.store(true, std::sync::atomic::Ordering::Relaxed);
++        use std::sync::atomic::Ordering::Relaxed;
++        // Refreshes are serialized by last. Publish a replacement only after
++        // all its bytes have been filled; allocation failure leaves it retryable.
++        let mut replacement = None;
++        let storage = match self.backing.get() {
++            Some(existing) => existing,
++            None => {
++                let Some(new) = host().and_then(|h| UploadBacking::new(h, self.bytes)) else {
++                    self.retry_detile.store(true, Relaxed);
++                    return;
++                };
++                replacement.insert(new)
++            }
++        };
++        self.changed.store(crate::host::moment(), Relaxed);
+         // Levels on demand: which levels are the title's is judged here,
+         // once, for what the staging buffer holds from now on. The step
+         // that gives levels their memory goes by this answer.
+@@ -1510,7 +1595,7 @@
+                 .min(self.bytes.saturating_sub(footprint.Offset) as usize);
+             // SAFETY: the subresource's part of the mapped staging buffer.
+             let linear = unsafe {
+-                std::slice::from_raw_parts_mut(self.data.add(footprint.Offset as usize), len)
++                std::slice::from_raw_parts_mut(storage.data.add(footprint.Offset as usize), len)
+             };
+             if mip < 32 && held & (1 << mip) == 0 {
+                 // Not the title's: zeros, not what lies in that memory.
+@@ -1521,10 +1606,16 @@
+                 self.layout
+                     .detile(tiled, mip, slice, linear, pitch, pitch * rows as usize)
+             {
++                self.retry_detile.store(true, Relaxed);
+                 tracing::warn!(?e, mip, slice, "texture not detiled");
+                 return;
+             }
+         }
++        if let Some(new) = replacement {
++            let _ = self.backing.set(new);
++            RESTORE_BYTES.fetch_add(self.bytes, Relaxed);
++        }
++        self.dirty.store(true, Relaxed);
+     }
+ }
+ 
+@@ -1874,29 +1965,16 @@
+             Some(&mut total),
+         );
+     }
+-    let (piece, buffer, base, data) = match crate::pool::staging(host, total) {
+-        Some((piece, buffer, base, data)) => (Some(piece), buffer, base, data),
+-        None => {
+-            let (buffer, data) = host.upload_buffer(total)?;
+-            crate::host::name(&buffer, || {
+-                format!(
+-                    "staging of {resource:?} {}x{}x{} f{}",
+-                    d.Width, d.Height, d.DepthOrArraySize, d.Format.0
+-                )
+-            });
+-            (None, buffer, 0, data)
+-        }
+-    };
++    let storage = UploadBacking::new(host, total)?;
+     tracing::debug!(?desc, total, "texture contents uploaded from title memory");
+     STAGED[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+     STAGED[1].fetch_add(total, std::sync::atomic::Ordering::Relaxed);
+     let s = Arc::new(Staging {
+-        buffer,
+-        base,
+-        _piece: piece,
++        backing: std::sync::OnceLock::from(storage),
++        changed: std::sync::atomic::AtomicU64::new(crate::host::moment()),
++        retry_detile: std::sync::atomic::AtomicBool::new(false),
+         #[cfg(feature = "diagnostics")]
+         size: total,
+-        data,
+         footprints,
+         rows,
+         layout,
