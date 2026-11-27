@@ -1,0 +1,34 @@
+diff --git a/crates/victory-gpu/src/pipeline/library.rs b/crates/victory-gpu/src/pipeline/library.rs
+--- a/crates/victory-gpu/src/pipeline/library.rs
++++ b/crates/victory-gpu/src/pipeline/library.rs
+@@ -595,7 +595,8 @@
+ /// last save and `SAVE_EVERY` has passed (or `now`).
+ pub(crate) fn save(now: bool) {
+     static LAST: Mutex<Option<std::time::Instant>> = Mutex::new(None);
+-    const SAVE_EVERY: std::time::Duration = std::time::Duration::from_secs(20);
++    // Batch background checkpoints. Explicit exit and warm saves still flush immediately.
++    const SAVE_EVERY: std::time::Duration = std::time::Duration::from_secs(120);
+     let (Some(dir), Some(library)) = (DIR.get(), library()) else { return };
+     {
+         let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
+@@ -608,7 +609,8 @@
+         tracing::warn!(error = %e, "host pipeline library not saved");
+         return;
+     }
+-    let tmp = dir.join(LIBRARY_FILE).with_extension("tmp");
++    let checkpoint_start = std::time::Instant::now();
++    let tmp = dir.join(LIBRARY_FILE).with_extension("tmp");
+     // The bytes of the library written to `tmp`; 0 when no pipeline was
+     // added: the library on disk is then what it was, and only the early
+     // list is written (a title pipeline first drawn with wrote all 1,352 MB
+@@ -661,7 +663,9 @@
+         .and_then(|()| write_atomically(&dir.join(EARLY_FILE), used.join("\n").as_bytes()));
+     match written {
+         Ok(()) => tracing::info!(
+-            bytes,
++            bytes,
++            checkpoint_ms = checkpoint_start.elapsed().as_millis() as u64,
++            forced = now,
+             early = used.len(),
+             made = MADE.load(Ordering::Relaxed),
+             loaded = LOADED.load(Ordering::Relaxed),
