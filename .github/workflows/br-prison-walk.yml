@@ -106,6 +106,13 @@ jobs:
           Add-Content br/apps/victory/src/main.rs '#[cfg(windows)] mod agility;'
       - run: rustup toolchain install
         working-directory: br
+      - name: Verify cached city texture footprints
+        working-directory: br
+        run: |
+          git apply ../patches/br-city-footprints.patch
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          cargo test --release --locked -p victory-gpu --lib cached_city_footprints_match_layout -- --nocapture
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
       - name: Build diagnostic executable
         working-directory: br
         run: cargo build --release -p victory --locked
@@ -150,7 +157,7 @@ jobs:
           & br/target/release/victory.exe run --help
       - uses: actions/upload-artifact@v4
         with:
-          name: victory-br-snapshot-pool
+          name: victory-br-city-footprints
           path: |
             stride-results.txt
             br/target/release/Run-Walk.ps1

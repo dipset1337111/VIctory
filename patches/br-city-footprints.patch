@@ -1,0 +1,109 @@
+--- a/crates/victory-gpu/src/resource.rs
++++ b/crates/victory-gpu/src/resource.rs
+@@ -1301,26 +1301,41 @@
+ /// `desc` is read from for a view that starts at level `first`; `None` as
+ /// [`placed_bytes`]. Remembered: asked for every slot that is looked at.
+ #[cfg(windows)]
+-pub(crate) fn placed_bytes_from(desc: &[u32; 14], first: u32) -> Option<u64> {
+-    if first == 0 || !held_only() {
+-        return placed_bytes(desc);
+-    }
+-    type Known = std::collections::HashMap<([u32; 14], u32), Option<u64>>;
+-    thread_local! {
+-        static KNOWN: std::cell::RefCell<Known> = std::cell::RefCell::default();
+-    }
+-    KNOWN.with(|known| {
+-        *known.borrow_mut().entry((*desc, first)).or_insert_with(|| {
+-            let whole = placed_bytes(desc)?;
+-            // SAFETY: 56 bytes in the description's layout.
+-            let d = unsafe { desc.as_ptr().cast::<ResourceDesc>().read_unaligned() };
+-            let Some(t) = texture_layout(&d).filter(|t| t.planes.len() == 1) else {
+-                return Some(whole);
+-            };
+-            let layout = &t.planes[0].layout;
+-            Some(layout.bytes_from(read_from(layout, first)).min(whole))
+-        })
+-    })
++pub(crate) fn placed_bytes_from(desc: &[u32; 14], first: u32) -> Option<u64> {
++    let first = if first == 0 || !held_only() { 0 } else { first };
++    // Words 1 and 13 are padding in ResourceDesc. They do not affect a footprint.
++    let mut key = *desc;
++    key[1] = 0;
++    key[13] = 0;
++    type Known = std::collections::HashMap<([u32; 14], u32), Option<u64>>;
++    thread_local! {
++        static KNOWN: std::cell::RefCell<Known> = std::cell::RefCell::default();
++    }
++    KNOWN.with(|known| {
++        let mut known = known.borrow_mut();
++        if let Some(size) = known.get(&(key, first)) {
++            return *size;
++        }
++        // Bound retained metadata during long streaming sessions.
++        if known.len() >= 4096 {
++            known.clear();
++        }
++        let size = (|| {
++            let whole = placed_bytes(desc)?;
++            if first == 0 {
++                return Some(whole);
++            }
++            // SAFETY: 56 bytes in the description's layout.
++            let d = unsafe { desc.as_ptr().cast::<ResourceDesc>().read_unaligned() };
++            let Some(t) = texture_layout(&d).filter(|t| t.planes.len() == 1) else {
++                return Some(whole);
++            };
++            let layout = &t.planes[0].layout;
++            Some(layout.bytes_from(read_from(layout, first)).min(whole))
++        })();
++        known.insert((key, first), size);
++        size
++    })
+ }
+ 
+ /// Host copies replaced by ones with more levels, for as long as a thread
+@@ -4814,6 +4829,44 @@
+         assert_eq!(texture_floor_bytes(Some(32 * GIB)), 2 * GIB);
+     }
+ 
++    #[cfg(windows)]
++    #[test]
++    fn cached_city_footprints_match_layout() {
++        use std::hint::black_box;
++        use std::time::Instant;
++        let base = [3u32, 0, 0, 0, 256, 0, 256, 0x9_0001, 98, 1, 0, 0x105, 0, 0];
++        let mut descriptions = Vec::new();
++        for n in 0..4098u32 {
++            let mut d = base;
++            d[4] = 256 + n;
++            descriptions.push(d);
++        }
++        for d in descriptions.iter().chain(descriptions.iter().take(4)) {
++            assert_eq!(placed_bytes_from(d, 0), placed_bytes(d));
++        }
++        let mut padded = base;
++        padded[1] = 137;
++        padded[13] = 293;
++        assert_eq!(placed_bytes_from(&padded, 0), placed_bytes(&base));
++        if held_only() {
++            assert!(placed_bytes_from(&base, 2).unwrap() < placed_bytes(&base).unwrap());
++            assert_eq!(placed_bytes_from(&padded, 2), placed_bytes_from(&base, 2));
++        }
++        let mut buffer = base;
++        buffer[0] = BUFFER;
++        assert_eq!(placed_bytes_from(&buffer, 0), None);
++        let start = Instant::now();
++        for i in 0..100_000 {
++            black_box(placed_bytes(black_box(&descriptions[i % 64])));
++        }
++        let direct = start.elapsed();
++        let start = Instant::now();
++        for i in 0..100_000 {
++            black_box(placed_bytes_from(black_box(&descriptions[i % 64]), 0));
++        }
++        println!("100000 repeated texture footprints: direct {direct:?}, cached {:?}", start.elapsed());
++    }
++
+     /// A placed texture viewed from a later level has a host copy of that
+     /// and the smaller levels; a view from an earlier one gets another.
+     #[cfg(windows)]
