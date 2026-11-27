@@ -1,0 +1,32 @@
+name: Clean BR Windows release
+on:
+  push:
+    branches: [build/clean-br-94e58415]
+permissions:
+  contents: read
+jobs:
+  release:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          repository: edsuuu/VI-BR-PORT
+          ref: 94e5841537daed4596fa7126cbda714fe550925b
+          persist-credentials: false
+      - name: Compile upstream release
+        run: cargo build --locked --release -p victory
+      - name: Check package entry points
+        shell: pwsh
+        run: |
+          $errors = $null
+          $tokens = $null
+          $null = [Management.Automation.Language.Parser]::ParseFile((Resolve-Path scripts/play.ps1).Path, [ref]$tokens, [ref]$errors)
+          if ($errors.Count) { throw ($errors | Out-String) }
+          & ./target/release/victory.exe run --help
+      - uses: actions/upload-artifact@v4
+        with:
+          name: clean-br-94e58415-windows
+          if-no-files-found: error
+          path: |
+            scripts/play.ps1
+            target/release/victory.exe
