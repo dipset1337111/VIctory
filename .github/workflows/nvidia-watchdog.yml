@@ -1,0 +1,42 @@
+name: NVIDIA watchdog Windows build
+on:
+  push:
+    branches: [fix/nvidia-watchdog]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 75
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: trustno1-coder/VIctory-NVIDIA
+          ref: f3534e6b09f113e369c3ade2a13ff3d711ce0cf1
+          path: nvidia
+      - name: Apply loader fix
+        working-directory: nvidia
+        run: |
+          git apply --check ../watchdog/loader.patch
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          git apply ../watchdog/loader.patch
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          Copy-Item ../watchdog/watchdog.rs crates/victory-loader/src/
+      - name: Build NVIDIA release
+        working-directory: nvidia
+        run: cargo build --release --locked -p victory
+      - name: Verify executable
+        working-directory: nvidia
+        run: |
+          & ./target/release/victory.exe --help
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          Copy-Item target/release/victory.exe ../watchdog/victory-watchdog.exe
+      - uses: actions/upload-artifact@v4
+        with:
+          name: VIctory-NVIDIA-Watchdog
+          path: |
+            watchdog/victory-watchdog.exe
+            watchdog/*.cmd
+          if-no-files-found: error

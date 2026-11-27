@@ -1,0 +1,23 @@
+diff --git a/crates/victory-loader/src/lib.rs b/crates/victory-loader/src/lib.rs
+--- a/crates/victory-loader/src/lib.rs
++++ b/crates/victory-loader/src/lib.rs
+@@ -42,4 +42,6 @@
+ pub mod write_sites;
+ #[cfg(windows)]
++mod watchdog;
++#[cfg(windows)]
+ mod windows;
+ 
+diff --git a/crates/victory-loader/src/windows.rs b/crates/victory-loader/src/windows.rs
+--- a/crates/victory-loader/src/windows.rs
++++ b/crates/victory-loader/src/windows.rs
+@@ -85,4 +85,9 @@
+         unsafe { crate::tls::redirect(loaded.base(), &loaded.info) }?;
+     }
++    if !loaded.info.is_dll() && std::env::var("VICTORY_NO_WATCHDOG").as_deref() == Ok("1") {
++        // SAFETY: the image has just been mapped and no title code has run.
++        let applied = unsafe { crate::watchdog::disarm_watchdog(loaded.base(), &prepared.original_hash) };
++        tracing::info!(applied, "title watchdog hooks");
++    }
+     tracing::info!(
+         base = format_args!("{:#x}", loaded.base()),
