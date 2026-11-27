@@ -237,3 +237,44 @@
          footprints,
          rows,
          layout,
+--- a/crates/victory-gpu/src/texture/ahead.rs
++++ b/crates/victory-gpu/src/texture/ahead.rs
+@@ -48,7 +48,9 @@
+ 
+ /// An upload on its way.
+ pub(crate) struct Job {
+-    staging: Arc<Staging>,
++    staging: Arc<Staging>,
++    source: ID3D12Resource,
++    base: u64,
+     copy: Arc<HostTexture>,
+     asked: std::time::Instant,
+     /// What to do when it has run; `None`: it has.
+@@ -130,7 +132,13 @@
+     if super::no_wait() && super::fill_unlocked() {
+         staging.expected.store(if there == u64::MAX { super::mapped_bytes(staging.memory, staging.read) } else { there }, Relaxed);
+     }
+-    let job = Arc::new(Job { staging, copy, asked: std::time::Instant::now(), then: Mutex::new(Some(Vec::new())) });
++    let Some(storage) = staging.backing.get() else {
++        copy.ahead.store(LISTED, Relaxed);
++        return turned_down();
++    };
++    let source = storage.buffer.clone();
++    let base = storage.base;
++    let job = Arc::new(Job { staging, source, base, copy, asked: std::time::Instant::now(), then: Mutex::new(Some(Vec::new())) });
+     BYTES.fetch_add(job.staging.read as u64, Relaxed);
+     ON_THEIR_WAY.lock().unwrap_or_else(|e| e.into_inner()).push((job.copy.serial, job.clone()));
+     Some(Taken::New(job))
+@@ -270,10 +278,10 @@
+             };
+             let from = D3D12_TEXTURE_COPY_LOCATION {
+                 // SAFETY: as above.
+-                pResource: unsafe { std::mem::transmute_copy(&s.buffer) },
++                pResource: unsafe { std::mem::transmute_copy(&self.source) },
+                 Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+                 Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+-                    PlacedFootprint: D3D12_PLACED_SUBRESOURCE_FOOTPRINT { Offset: s.base + footprint.Offset, ..*footprint },
++                    PlacedFootprint: D3D12_PLACED_SUBRESOURCE_FOOTPRINT { Offset: self.base + footprint.Offset, ..*footprint },
+                 },
+             };
+             // SAFETY: the caller's.
