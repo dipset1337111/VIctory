@@ -1,0 +1,120 @@
+diff --git a/crates/victory-gpu/src/descriptor.rs b/crates/victory-gpu/src/descriptor.rs
+--- a/crates/victory-gpu/src/descriptor.rs
++++ b/crates/victory-gpu/src/descriptor.rs
+@@ -12,6 +12,8 @@
+ 
+ #[cfg(windows)]
+ pub(crate) mod host;
++#[cfg(windows)]
++mod page_reads;
+ 
+ const HEAP_IIDS: [Iid; 4] = [
+     guid(
+@@ -359,16 +361,9 @@
+         let found: Vec<std::sync::Mutex<SyncPart>> = parts.chunks(SYNC_PAGES).map(|_| Default::default()).collect();
+         crate::land::each_view(true, found.len(), &|n| {
+             let mut out = SyncPart::default();
+-            let mut page_bytes: Vec<u8> = Vec::new();
+-            let mut changed: Vec<u32> = Vec::new();
+-            for &(from, to) in parts.chunks(SYNC_PAGES).nth(n).unwrap_or_default() {
+-                // The page's records are read through the kernel, into a
+-                // copy: a page the title unmaps meanwhile fails the read
+-                // where 2,048 reads in place would fault.
+-                page_bytes.resize(to - from, 0);
+-                if !crate::host::read_into(from as *const u8, &mut page_bytes) {
+-                    continue;
+-                }
++            let mut changed: Vec<u32> = Vec::new();
++            let batch = parts.chunks(SYNC_PAGES).nth(n).unwrap_or_default();
++            page_reads::visit(batch, |from, dst| crate::host::read_into(from as *const u8, dst), |from, to, page_bytes| {
+                 out.pages += 1;
+                 out.views += u64::from(crate::watch::guarded(from, to));
+                 out.bytes += (to - from) as u64;
+@@ -377,7 +372,7 @@
+                 // to the range that holds its first byte.
+                 let first = ((from - start as usize) as u64).div_ceil(step).max(slots.start);
+                 let Some(records) = page_bytes.get((start + first * step) as usize - from..) else {
+-                    continue;
++                    return;
+                 };
+                 let count = (records.len() as u64 / step).min(slots.end.saturating_sub(first));
+                 out.looked += count;
+@@ -429,7 +424,7 @@
+                         2
+                     }] += 1;
+                 }
+-            }
++            });
+             *found[n].lock().unwrap_or_else(|e| e.into_inner()) = out;
+         });
+         drop(copied);
+diff --git a/crates/victory-gpu/src/descriptor/page_reads.rs b/crates/victory-gpu/src/descriptor/page_reads.rs
+new file mode 100644
+--- /dev/null
++++ b/crates/victory-gpu/src/descriptor/page_reads.rs
+@@ -0,0 +1,65 @@
++/// Read adjacent ranges in one call, retaining individual range boundaries
++/// for descriptor decoding. The caller limits each batch to eight pages.
++pub(crate) fn visit(
++    ranges: &[(usize, usize)],
++    mut read: impl FnMut(usize, &mut [u8]) -> bool,
++    mut page: impl FnMut(usize, usize, &[u8]),
++) {
++    let mut remaining = ranges;
++    let mut bytes = Vec::new();
++    while let Some(&(start, mut end)) = remaining.first() {
++        let mut count = 1;
++        while let Some(&(next, next_end)) = remaining.get(count) {
++            if next != end {
++                break;
++            }
++            end = next_end;
++            count += 1;
++        }
++        let (run, rest) = remaining.split_at(count);
++        remaining = rest;
++        bytes.resize(end - start, 0);
++        if read(start, &mut bytes) {
++            for &(a, b) in run {
++                page(a, b, &bytes[a - start..b - start]);
++            }
++        } else if count > 1 {
++            // A single unmapped page can invalidate the entire combined read.
++            for &(a, b) in run {
++                let dst = &mut bytes[..b - a];
++                if read(a, dst) {
++                    page(a, b, dst);
++                }
++            }
++        }
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::visit;
++
++    #[test]
++    fn preserves_pages_and_bytes_with_gaps_and_unmapped_pages() {
++        let ranges = [(3, 8), (8, 16), (16, 21), (32, 40)];
++        for mask in 0u8..16 {
++            let mut calls = 0;
++            let mut actual = Vec::new();
++            visit(&ranges, |a, dst| {
++                calls += 1;
++                for (i, byte) in dst.iter_mut().enumerate() {
++                    let addr = a + i;
++                    let index = ranges.iter().position(|&(lo, hi)| (lo..hi).contains(&addr)).unwrap();
++                    if mask & (1 << index) != 0 { return false; }
++                    *byte = addr as u8;
++                }
++                true
++            }, |a, b, bytes| actual.push((a, b, bytes.to_vec())));
++            let expected: Vec<_> = ranges.iter().enumerate()
++                .filter(|(i, _)| mask & (1 << i) == 0)
++                .map(|(_, &(a, b))| (a, b, (a as u8..b as u8).collect::<Vec<_>>())).collect();
++            assert_eq!(actual, expected);
++            if mask == 0 { assert_eq!(calls, 2); }
++        }
++    }
++}
