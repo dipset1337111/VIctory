@@ -1,0 +1,23 @@
+name: BR prewarm launcher
+on:
+  push:
+    branches: [test/br-prison-prewarm]
+permissions:
+  contents: read
+jobs:
+  verify:
+    runs-on: windows-2025
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate Windows PowerShell launcher
+        shell: powershell
+        run: |
+          $tokens = $null
+          $errors = $null
+          $null = [System.Management.Automation.Language.Parser]::ParseFile((Resolve-Path prewarm/Warm-And-Play.ps1), [ref]$tokens, [ref]$errors)
+          if ($errors.Count) { throw ($errors | Out-String) }
+          Get-CimInstance Win32_PerfFormattedData_PerfOS_Memory | Select-Object AvailableMBytes,PagesInputPersec,CommittedBytes
+      - uses: actions/upload-artifact@v4
+        with:
+          name: BR-Prewarm
+          path: prewarm/
