@@ -1,0 +1,35 @@
+name: NVIDIA buffer test
+on:
+  push:
+    branches: [test/nvidia-buffer-01]
+    paths: ['buffer-test/**', '.github/workflows/nvidia-buffer.yml']
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: windows-2025
+    env:
+      RUSTFLAGS: '-C target-feature=+crt-static'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          repository: trustno1-coder/VIctory-NVIDIA
+          ref: f3534e6b09f113e369c3ade2a13ff3d711ce0cf1
+          path: nvidia
+          persist-credentials: false
+      - name: Build patched NVIDIA release
+        working-directory: nvidia
+        shell: pwsh
+        run: |
+          Copy-Item ../buffer-test/send.rs crates/victory-gpu/src/host/send.rs -Force
+          cargo build --release --locked -p victory
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          ./target/release/victory.exe play --help
+      - uses: actions/upload-artifact@v4
+        with:
+          name: VIctory-NVIDIA-BufferTest
+          path: nvidia/target/release/victory.exe
+          if-no-files-found: error
