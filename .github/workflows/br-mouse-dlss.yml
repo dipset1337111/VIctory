@@ -1,7 +1,7 @@
-name: BR mouse and DLSS
+name: BR DLSS present
 on:
   push:
-    branches: [test/br-prison-dlss-mouse]
+    branches: [test/br-dlss-present]
   workflow_dispatch:
 permissions:
   contents: read
@@ -87,5 +87,5 @@ jobs:
           Get-FileHash integration/package/victory.exe
       - uses: actions/upload-artifact@v4
         with:
-          name: BR-Mouse-DLSS
+          name: BR-DLSS-Present
           path: integration/package/
