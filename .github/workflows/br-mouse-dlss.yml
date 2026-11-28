@@ -1,4 +1,4 @@
-name: BR readback ranges
+name: BR submission timing
 on:
   push:
     branches: [test/br-readback-ranges]
@@ -47,12 +47,19 @@ jobs:
           Add-Content br/apps/victory/src/main.rs ''
           Add-Content br/apps/victory/src/main.rs '#[cfg(windows)] mod agility;'
       - run: python integration/apply.py
-      - run: cargo build --release --locked -p victory
+      - run: cargo build --release --locked -p victory --features diagnostics
         working-directory: br
       - run: cargo test --release --locked -p victory-hle mouse_
         working-directory: br
       - run: cargo test --release --locked -p victory-gpu adjacent_fetch_respects_buffers_and_both_offsets
         working-directory: br
+      - name: Verify release includes submission timing counters
+        shell: python
+        run: |
+          from pathlib import Path
+          binary = Path("br/target/release/victory.exe").read_bytes()
+          if b"planning steps done on the card" not in binary:
+              raise SystemExit("Missing per-frame GPU submission timing counters")
       - name: Stage Microsoft D3D12 runtime
         shell: pwsh
         run: |
@@ -89,5 +96,5 @@ jobs:
           Get-FileHash integration/package/victory.exe
       - uses: actions/upload-artifact@v4
         with:
-          name: BR-Readback-Ranges
+          name: BR-Submit-Timing
           path: integration/package/
