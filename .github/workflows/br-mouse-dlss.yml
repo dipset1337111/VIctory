@@ -15,19 +15,74 @@ jobs:
       - uses: actions/checkout@v4
         with:
           repository: edsuuu/VI-BR-PORT
-          ref: 8bb5142d8b38f4a992102a4d50cd0c2202c47753
+          ref: 94e5841537daed4596fa7126cbda714fe550925b
           path: br
       - uses: actions/checkout@v4
         with:
           repository: trustno1-coder/VIctory-NVIDIA
           ref: d11233aa2251de05f85020ea842a7c18fc7a2612
           path: nvidia
+      - uses: actions/checkout@v4
+        with:
+          repository: dipset1337111/VIctory
+          ref: b5429714f009e0ecf3fc328e3a58e851c433332c
+          path: prison
+      - name: Apply cache checkpoint patch
+        run: git -C br apply --check ../prison/patches/br-cache-checkpoint.patch
+      - run: git -C br apply ../prison/patches/br-cache-checkpoint.patch
+      - name: Apply contiguous descriptor reads
+        run: git -C br apply ../prison/patches/br-descriptor-reads.patch
+      - name: Check grouped reads against page-by-page results
+        working-directory: br
+        run: |
+          rustc --edition=2024 --test crates/victory-gpu/src/descriptor/page_reads.rs -o page-tests.exe
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          ./page-tests.exe
+      - name: Enable SDK exports in the BR executable
+        shell: pwsh
+        run: |
+          Copy-Item prison/apps/victory/src/agility.rs br/apps/victory/src/agility.rs
+          $src = Get-Content prison/apps/victory/build.rs -Raw
+          $src.Replace('cfg!(feature = "agility")', 'true') | Set-Content br/apps/victory/build.rs
+          Add-Content br/apps/victory/src/main.rs ''
+          Add-Content br/apps/victory/src/main.rs '#[cfg(windows)] mod agility;'
       - run: python integration/apply.py
       - run: cargo build --release --locked -p victory
         working-directory: br
       - run: cargo test --release --locked -p victory-hle mouse_
         working-directory: br
+      - name: Stage Microsoft D3D12 runtime
+        shell: pwsh
+        run: |
+          $version = '1.620.2'
+          $package = "microsoft.direct3d.d3d12.$version.nupkg"
+          $baseUrl = "https://api.nuget.org/v3-flatcontainer/microsoft.direct3d.d3d12/$version"
+          $zip = Join-Path $env:RUNNER_TEMP 'd3d12-sdk.zip'
+          Invoke-WebRequest -Uri "$baseUrl/$package" -OutFile $zip
+          $expected = 'd683ff7f5726906c3f43d299f6cdd4b1cad22f8329ccd27b3492d0a1413d9904102b8d543419bec3b3545c86bf49f6a500ebf42d95c999aa0969e5d693032735'
+          $actual = (Get-FileHash -LiteralPath $zip -Algorithm SHA512).Hash.ToLowerInvariant()
+          if ($actual -cne $expected) { throw 'NuGet package SHA-512 mismatch' }
+          $unpacked = Join-Path $env:RUNNER_TEMP 'd3d12-sdk'
+          Expand-Archive -LiteralPath $zip -DestinationPath $unpacked
+          $destination = 'br/target/release/D3D12'
+          New-Item -ItemType Directory -Path $destination -Force | Out-Null
+          foreach ($name in @('D3D12Core.dll', 'd3d12SDKLayers.dll')) {
+            $dll = Join-Path $unpacked "build/native/bin/x64/$name"
+            $signature = Get-AuthenticodeSignature -LiteralPath $dll
+            if ($signature.Status -ne 'Valid' -or $signature.SignerCertificate.Subject -notmatch 'O=Microsoft Corporation') {
+              throw "$name does not have a valid Microsoft signature"
+            }
+            Copy-Item -LiteralPath $dll -Destination (Join-Path $destination $name)
+          }
+      - name: Verify diagnostic executable exports
+        shell: pwsh
+        run: |
+          $report = & br/target/release/victory.exe inspect br/target/release/victory.exe --exports | Out-String
+          if ($LASTEXITCODE -ne 0 -or $report -notmatch 'D3D12SDKVersion' -or $report -notmatch 'D3D12SDKPath') {
+            throw 'The diagnostic executable does not export the Agility SDK settings'
+          }
       - run: |
+          Copy-Item br/target/release/D3D12 integration/package/ -Recurse
           Copy-Item br/target/release/victory.exe integration/package/
           Get-FileHash integration/package/victory.exe
       - uses: actions/upload-artifact@v4

@@ -6,6 +6,8 @@ Set-Location -LiteralPath $PSScriptRoot
 if (!(Test-Path '.\D3D12\D3D12Core.dll')) {
     Copy-Item -LiteralPath (Join-Path $old 'D3D12') -Destination . -Recurse -ErrorAction Stop
 }
+$knownGame = Join-Path $root 'GTA6.Xbox.v1.0.2.1-CYBERLEEK\game_scarlett_master.exe'
+if (!$Game -and (Test-Path -LiteralPath $knownGame)) { $Game = $knownGame }
 if (!$Game -and $env:VICTORY_GAME_DIR) {
     $candidate = Join-Path $env:VICTORY_GAME_DIR 'game_scarlett_master.exe'
     if (Test-Path -LiteralPath $candidate) { $Game = $candidate }
@@ -47,8 +49,10 @@ $env:VICTORY_PIPELINE_WORKERS = '4'
 $env:VICTORY_UPLOAD_AHEAD = '1'
 $env:VICTORY_JOIN_COPIES = '1'
 $env:VICTORY_JOIN_PARTS = '8'
+$env:VICTORY_LOG = 'info'
+Remove-Item Env:\VICTORY_ASYNC_SUBMIT, Env:\VICTORY_CARD_REHASH_RUNS -ErrorAction SilentlyContinue
 $log = Join-Path $PSScriptRoot ("BR-{0:yyyyMMdd-HHmmss}.log" -f (Get-Date))
 Write-Host "Log: $log"
 $ErrorActionPreference = 'Continue'
-& '.\victory.exe' run $exe.FullName --console series-s --execute 2>&1 | Tee-Object -FilePath $log
+& '.\victory.exe' run $exe.FullName --console series-s --execute *> $log
 exit $LASTEXITCODE
