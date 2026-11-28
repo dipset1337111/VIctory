@@ -1,7 +1,7 @@
-name: BR DLSS present
+name: BR readback ranges
 on:
   push:
-    branches: [test/br-dlss-present]
+    branches: [test/br-readback-ranges]
   workflow_dispatch:
 permissions:
   contents: read
@@ -51,6 +51,8 @@ jobs:
         working-directory: br
       - run: cargo test --release --locked -p victory-hle mouse_
         working-directory: br
+      - run: cargo test --release --locked -p victory-gpu adjacent_fetch_respects_buffers_and_both_offsets
+        working-directory: br
       - name: Stage Microsoft D3D12 runtime
         shell: pwsh
         run: |
@@ -87,5 +89,5 @@ jobs:
           Get-FileHash integration/package/victory.exe
       - uses: actions/upload-artifact@v4
         with:
-          name: BR-DLSS-Present
+          name: BR-Readback-Ranges
           path: integration/package/
