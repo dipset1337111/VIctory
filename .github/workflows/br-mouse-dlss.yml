@@ -1,0 +1,36 @@
+name: BR mouse and DLSS
+on:
+  push:
+    branches: [test/br-prison-dlss-mouse]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: windows-2025
+    env:
+      RUSTFLAGS: -C target-feature=+crt-static
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: edsuuu/VI-BR-PORT
+          ref: 8bb5142d8b38f4a992102a4d50cd0c2202c47753
+          path: br
+      - uses: actions/checkout@v4
+        with:
+          repository: trustno1-coder/VIctory-NVIDIA
+          ref: d11233aa2251de05f85020ea842a7c18fc7a2612
+          path: nvidia
+      - run: python integration/apply.py
+      - run: cargo build --release --locked -p victory
+        working-directory: br
+      - run: cargo test --release --locked -p victory-hle mouse_
+        working-directory: br
+      - run: |
+          Copy-Item br/target/release/victory.exe integration/package/
+          Get-FileHash integration/package/victory.exe
+      - uses: actions/upload-artifact@v4
+        with:
+          name: BR-Mouse-DLSS
+          path: integration/package/
