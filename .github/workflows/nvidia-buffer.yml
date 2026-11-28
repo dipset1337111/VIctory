@@ -24,12 +24,14 @@ jobs:
         working-directory: nvidia
         shell: pwsh
         run: |
+          git apply --ignore-space-change ../buffer-test/queue-trace.patch
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
           Copy-Item ../buffer-test/send.rs crates/victory-gpu/src/host/send.rs -Force
           cargo build --release --locked -p victory
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
           ./target/release/victory.exe play --help
       - uses: actions/upload-artifact@v4
         with:
-          name: VIctory-NVIDIA-BufferTest
+          name: VIctory-NVIDIA-QueueTest
           path: nvidia/target/release/victory.exe
           if-no-files-found: error

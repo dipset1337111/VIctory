@@ -1,0 +1,144 @@
+diff --git a/crates/victory-gpu/src/queue/behind.rs b/crates/victory-gpu/src/queue/behind.rs
+--- a/crates/victory-gpu/src/queue/behind.rs
++++ b/crates/victory-gpu/src/queue/behind.rs
+@@ -57,6 +57,8 @@ pub(super) trait Work: Send {
+     type Ask;
+     fn ask(&self) -> Option<Self::Ask>;
+     fn met(ask: &Self::Ask) -> bool;
++    fn blocked(_queue: usize, _ask: &Self::Ask) {}
++    fn trace_producer(&self, _queue: usize) {}
+     /// Whether it is a present: everything before it goes first, met or not.
+     fn shows(&self) -> bool;
+     /// Whether it is a submission.
+@@ -329,8 +331,12 @@ impl<W: Work> Lane<W> {
+         let Some(&(first, ..)) = heads.first() else {
+             return false;
+         };
+-        let ready = heads.iter().find(|(number, _, ask, shows)| match ask {
+-            Some(ask) => W::met(ask),
++        let ready = heads.iter().find(|(number, queue, ask, shows)| match ask {
++            Some(ask) => {
++                let ready = W::met(ask);
++                if !ready { W::blocked(*queue, ask); }
++                ready
++            },
+             // A present comes behind everything given before it.
+             None => !shows || *number == first || !super::forces(),
+         });
+@@ -362,6 +368,7 @@ impl<W: Work> Lane<W> {
+             state.running = Some(entry.queue);
+             entry
+         };
++        entry.what.trace_producer(entry.queue);
+         let (shows, mut runs) = (entry.what.shows(), usize::from(entry.what.runs()));
+         // The highest mark of what it is made of (`crate::heap_marks`).
+         let mut mark = entry.mark;
+@@ -477,9 +484,60 @@ enum Ask {
+     Lists(Recordings),
+ }
+ 
++static WATCH_MEMORY: Mutex<Option<crate::list::ValueWait>> = Mutex::new(None);
++static WATCH_ADDRESS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
++static WATCH_FENCE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
++static WATCH_VALUE: AtomicU64 = AtomicU64::new(0);
++
++pub(crate) fn written(address: usize, value: u64, bytes: usize) {
++    if address != 0 && WATCH_ADDRESS.load(Relaxed) == address {
++        tracing::info!(address, value, bytes, "queue trace: watched memory written");
++    }
++}
++
++pub(crate) fn fence_event(queue: usize, fence: usize, value: u64) {
++    if fence != 0 && WATCH_FENCE.load(Relaxed) == fence && value >= WATCH_VALUE.load(Relaxed) {
++        tracing::info!(queue, fence, value, "queue trace: watched fence signal (queue zero means published)");
++    }
++}
++
+ impl Work for Job {
+     type Ask = Ask;
+ 
++    fn blocked(queue: usize, ask: &Ask) {
++        static START: OnceLock<Instant> = OnceLock::new();
++        static LAST: AtomicU64 = AtomicU64::new(u64::MAX);
++        if !super::trace_waits() || matches!(ask, Ask::Lists(_)) { return; }
++        let second = START.get_or_init(Instant::now).elapsed().as_secs();
++        if LAST.load(Relaxed) == second || LAST.swap(second, Relaxed) == second { return; }
++        match ask {
++            Ask::Value(wait) => {
++                *WATCH_MEMORY.lock().unwrap_or_else(|e| e.into_inner()) = Some(*wait);
++                WATCH_ADDRESS.store(wait.place().0, Relaxed);
++                tracing::info!(queue, ?wait, "queue trace: blocked memory wait");
++            }
++            &Ask::Wait(fence, value) => {
++                WATCH_VALUE.store(value, Relaxed);
++                WATCH_FENCE.store(fence, Relaxed);
++                let completed = crate::fence::completed(fence as This);
++                tracing::info!(queue, fence, value, completed, "queue trace: blocked fence wait");
++            }
++            Ask::Lists(_) => {}
++        }
++    }
++    fn trace_producer(&self, queue: usize) {
++        if WATCH_ADDRESS.load(Relaxed) == 0 { return; }
++        let (lists, order) = match self {
++            Job::Run(_, lists, order) | Job::Joined(_, lists, order, ..) => (lists, order),
++            _ => return,
++        };
++        let watched = *WATCH_MEMORY.lock().unwrap_or_else(|e| e.into_inner());
++        if let Some(wait) = watched {
++            if order.iter().any(|&i| crate::host::will_meet(lists[i].host(), &wait)) {
++                tracing::info!(queue, ?wait, "queue trace: candidate memory producer submitted");
++            }
++        }
++    }
+     fn ask(&self) -> Option<Ask> {
+         match self {
+             &Job::Wait(fence, value) => Some(Ask::Wait(fence, value)),
+diff --git a/crates/victory-gpu/src/queue.rs b/crates/victory-gpu/src/queue.rs
+--- a/crates/victory-gpu/src/queue.rs
++++ b/crates/victory-gpu/src/queue.rs
+@@ -8,7 +8,13 @@ use crate::object::{self, E_INVALIDARG, HRESULT, Iid, Object, QUEUE, S_OK, Table
+ use crate::resource::PAGEABLE_IIDS;
+ 
+ #[cfg(windows)]
+-mod behind;
++pub(crate) mod behind;
++
++#[cfg(windows)]
++fn trace_waits() -> bool {
++    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
++    *ON.get_or_init(|| std::env::var_os("VICTORY_QUEUE_TRACE").is_some_and(|v| v == "1"))
++}
+ 
+ const QUEUE_IIDS: [Iid; 4] = [
+     guid(
+@@ -734,6 +740,8 @@ extern "system" fn signal(this: This, fence: This, value: u64) -> HRESULT {
+     if fence.is_null() {
+         return E_INVALIDARG;
+     }
++    #[cfg(windows)]
++    behind::fence_event(this as usize, fence as usize, value);
+     let _called = crate::timeline::span("the title's queue Signal");
+     #[cfg(windows)]
+     if behind::on() && !this.is_null() {
+@@ -864,6 +872,8 @@ impl Written {
+             }
+             #[cfg(windows)]
+             windows_sys::Win32::System::Threading::WakeByAddressAll(at.cast());
++            #[cfg(windows)]
++            behind::written(at as usize, value, bytes);
+         }
+     }
+ }
+diff --git a/crates/victory-gpu/src/fence.rs b/crates/victory-gpu/src/fence.rs
+--- a/crates/victory-gpu/src/fence.rs
++++ b/crates/victory-gpu/src/fence.rs
+@@ -158,6 +158,8 @@ pub(crate) fn set(this: This, value: u64) {
+     crate::timeline::told("a fence set", this as usize, value);
+     let mut waiters = fence.waiters.lock().unwrap_or_else(|e| e.into_inner());
+     fence.value.store(value, Ordering::Release);
++    #[cfg(windows)]
++    crate::queue::behind::fence_event(0, this as usize, value);
+     waiters.retain(|&(wanted, event)| {
+         let reached = wanted <= value;
+         if reached {
